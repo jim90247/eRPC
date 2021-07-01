@@ -29,7 +29,7 @@ else()
   message("Using non-MSVC build")
   set(CMAKE_CXX_FLAGS "-std=c++11 -march=native -Wall -Wextra -Werror -pedantic")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-conversion -Wold-style-cast -Wno-unused-function")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nested-anon-types -Wno-keyword-macro -Wno-deprecated-declarations")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nested-anon-types -Wno-keyword-macro -Wno-deprecated-declarations -Wno-address-of-packed-member")
 endif()
 
 # Parse the user-exposed options
@@ -345,9 +345,9 @@ target_link_libraries(${APP} ${LIBRARIES})
 
 # Compile hello_world apps
 add_executable(hello_server hello_world/server.cc)
-target_link_libraries(hello_server erpc)
+target_link_libraries(hello_server erpc ${LIBRARIES})
 add_executable(hello_client hello_world/client.cc)
-target_link_libraries(hello_client erpc)
+target_link_libraries(hello_client erpc ${LIBRARIES})
 
 # Compile the tests
 if(TESTING)
