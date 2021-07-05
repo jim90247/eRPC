@@ -106,8 +106,8 @@ static_assert(sizeof(app_stats_t) == 64, "");
 // Per-thread application context
 class AppContext : public BasicAppContext {
  public:
-  struct timespec tput_t0;  // Start time for throughput measurement
-  app_stats_t *app_stats;   // Common stats array for all threads
+  size_t start_tsc_;       // Start time for throughput measurement
+  app_stats_t *app_stats;  // Common stats array for all threads
 
   size_t stat_resp_rx[kAppMaxConcurrency] = {0};  // Resps received for batch i
   size_t stat_resp_rx_tot = 0;  // Total responses received (all batches)
@@ -272,8 +272,7 @@ void connect_sessions(AppContext &c) {
 }
 
 void print_stats(AppContext &c) {
-  // double seconds = erpc::sec_since(c.tput_t0);
-  double seconds = c.rpc_->sec_since_creation();
+  double seconds = erpc::to_sec(erpc::rdtsc() - c.start_tsc_, c.rpc_->get_freq_ghz());
 
   // Min/max responses for a concurrent batch, to check for stagnated batches
   size_t max_resps = 0, min_resps = SIZE_MAX;
@@ -344,7 +343,7 @@ void print_stats(AppContext &c) {
   c.rpc_->pkt_loss_stats_.num_re_tx_ = 0;
   c.latency.reset();
 
-  clock_gettime(CLOCK_REALTIME, &c.tput_t0);
+  c.start_tsc_ = erpc::rdtsc();
 }
 
 // The function executed by each thread in the cluster
@@ -380,7 +379,7 @@ void thread_func(size_t thread_id, app_stats_t *app_stats, erpc::Nexus *nexus) {
          FLAGS_process_id, thread_id);
 
   // Start work
-  clock_gettime(CLOCK_REALTIME, &c.tput_t0);
+  c.start_tsc_ = erpc::rdtsc();
   for (size_t i = 0; i < FLAGS_concurrency; i++) send_reqs(&c, i);
 
   for (size_t i = 0; i < FLAGS_test_ms; i += 1000) {
