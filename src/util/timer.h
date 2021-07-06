@@ -12,6 +12,7 @@
 
 namespace erpc {
 
+#if defined(__x86_64__)
 /// Return the TSC
 static inline size_t rdtsc() {
   uint64_t rax;
@@ -19,6 +20,19 @@ static inline size_t rdtsc() {
   asm volatile("rdtsc" : "=a"(rax), "=d"(rdx));
   return static_cast<size_t>((rdx << 32) | rax);
 }
+#elif defined(__aarch64__)
+static inline size_t rdtsc() {
+  uint64_t val;
+  asm volatile("isb; mrs %0, cntvct_el0" : "=r"(val));
+  return val;
+}
+
+static double measure_rdtsc_freq() {
+  uint64_t timer_freq_hz = 0ULL;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(timer_freq_hz));
+  return static_cast<double>(timer_freq_hz) / 1e9;
+}
+#endif
 
 /// An alias for rdtsc() to distinguish calls on the critical path
 static const auto &dpath_rdtsc = rdtsc;
@@ -72,6 +86,7 @@ class ChronoTimer {
   std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
 };
 
+#if defined(__x86_64__)
 static double measure_rdtsc_freq() {
   ChronoTimer chrono_timer;
   const uint64_t rdtsc_start = rdtsc();
@@ -90,6 +105,7 @@ static double measure_rdtsc_freq() {
 
   return freq_ghz;
 }
+#endif
 
 /// Convert cycles measured by rdtsc with frequence \p freq_ghz to seconds
 static double to_sec(size_t cycles, double freq_ghz) {
