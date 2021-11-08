@@ -52,8 +52,9 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = ArgumentParser()
-    parser.add_argument('input')
+    parser = ArgumentParser(
+        description='Parse per-thread and total performance from small_rpc_tput\'s standard output.')
+    parser.add_argument('input', help='Path to the stdout log file')
     parser.add_argument('-o', '--output', help='Path to save record')
     args = parser.parse_args()
     main(args)
