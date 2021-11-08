@@ -11,7 +11,6 @@
 static constexpr size_t kAppEvLoopMs = 1000;  // Duration of event loop
 static constexpr bool kAppVerbose = false;    // Print debug info on datapath
 static constexpr size_t kAppReqType = 1;      // eRPC request type
-static constexpr size_t kAppRespSize = 8;
 static constexpr size_t kAppMinReqSize = 64;
 static constexpr size_t kAppMaxReqSize = 1024;
 
@@ -22,6 +21,7 @@ volatile sig_atomic_t ctrl_c_pressed = 0;
 void ctrl_c_handler(int) { ctrl_c_pressed = 1; }
 
 DEFINE_uint64(num_server_processes, 1, "Number of server processes");
+DEFINE_uint64(resp_size, 8, "Size of the server's RPC response in bytes");
 
 class ServerContext : public BasicAppContext {
  public:
@@ -57,7 +57,7 @@ class ClientContext : public BasicAppContext {
 void req_handler(erpc::ReqHandle *req_handle, void *_context) {
   auto *c = static_cast<ServerContext *>(_context);
   erpc::Rpc<erpc::CTransport>::resize_msg_buffer(&req_handle->pre_resp_msgbuf_,
-                                                 kAppRespSize);
+                                                 FLAGS_resp_size);
   // erpc::nano_sleep((c->fast_rand_.next_u32() % 5) * 1000 * 1000, 3.0);
   c->rpc_->enqueue_response(req_handle, &req_handle->pre_resp_msgbuf_);
 }
@@ -70,6 +70,7 @@ void server_func(erpc::Nexus *nexus) {
   ServerContext c;
   erpc::Rpc<erpc::CTransport> rpc(nexus, static_cast<void *>(&c), 0 /* tid */,
                                   basic_sm_handler, phy_port);
+  rpc.set_pre_resp_msgbuf_size(FLAGS_resp_size);
   c.rpc_ = &rpc;
 
   while (true) {
@@ -104,7 +105,7 @@ inline void send_req(ClientContext &c) {
     if (c.req_size_ > kAppMaxReqSize) c.req_size_ = kAppMinReqSize;
 
     c.rpc_->resize_msg_buffer(&c.req_msgbuf_, c.req_size_);
-    c.rpc_->resize_msg_buffer(&c.resp_msgbuf_, c.req_size_);
+    c.rpc_->resize_msg_buffer(&c.resp_msgbuf_, FLAGS_resp_size);
   }
 
   c.start_tsc_ = erpc::rdtsc();
@@ -120,7 +121,7 @@ inline void send_req(ClientContext &c) {
 
 void app_cont_func(void *_context, void *) {
   auto *c = static_cast<ClientContext *>(_context);
-  assert(c->resp_msgbuf_.get_data_size() == kAppRespSize);
+  assert(c->resp_msgbuf_.get_data_size() == FLAGS_resp_size);
 
   if (kAppVerbose) {
     printf("Latency: Received response of size %zu bytes\n",
@@ -151,9 +152,7 @@ void client_func(erpc::Nexus *nexus) {
   c.req_size_ = kAppMinReqSize;
 
   c.req_msgbuf_ = rpc.alloc_msg_buffer_or_die(kAppMaxReqSize);
-  c.resp_msgbuf_ = rpc.alloc_msg_buffer_or_die(kAppMaxReqSize);
-  c.rpc_->resize_msg_buffer(&c.req_msgbuf_, c.req_size_);
-  c.rpc_->resize_msg_buffer(&c.resp_msgbuf_, c.req_size_);
+  c.resp_msgbuf_ = rpc.alloc_msg_buffer_or_die(FLAGS_resp_size);
 
   connect_sessions(c);
 
@@ -161,7 +160,8 @@ void client_func(erpc::Nexus *nexus) {
          FLAGS_process_id);
   printf(
       "req_size median_us 5th_us 99th_us 99.9th_us 99.99th_us 99.999th_us "
-      "99.9999th_us max_us [total_samples, total_time]\n");
+      "99.9999th_us max_us [new samples, total_samples in distribution, "
+      "total_time]\n");
 
   send_req(c);
   for (size_t i = 0; i < FLAGS_test_ms; i += 1000) {
@@ -176,7 +176,7 @@ void client_func(erpc::Nexus *nexus) {
     } else {
       printf(
           "%zu %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f "
-          "[%zu samples, %zu seconds]\n",
+          "[%zu new samples, %zu total samples, %zu seconds]\n",
           c.req_size_,
           hdr_value_at_percentile(c.latency_hist_, 50.0) / kAppLatFac,
           hdr_value_at_percentile(c.latency_hist_, 5.0) / kAppLatFac,
@@ -185,7 +185,9 @@ void client_func(erpc::Nexus *nexus) {
           hdr_value_at_percentile(c.latency_hist_, 99.99) / kAppLatFac,
           hdr_value_at_percentile(c.latency_hist_, 99.999) / kAppLatFac,
           hdr_value_at_percentile(c.latency_hist_, 99.9999) / kAppLatFac,
-          hdr_max(c.latency_hist_) / kAppLatFac, c.latency_samples_, i / 1000);
+          hdr_max(c.latency_hist_) / kAppLatFac,
+          c.latency_samples_ - c.latency_samples_prev_, c.latency_samples_,
+          i / 1000);
     }
     fflush(stdout);
 

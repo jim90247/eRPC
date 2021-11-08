@@ -1,7 +1,7 @@
 eRPC is a fast and general-purpose RPC library for datacenter networks.
 Our NSDI 2019 [paper](https://www.usenix.org/system/files/nsdi19-kalia.pdf)
 describes the system in detail.
-[Documentation](http://www.cs.cmu.edu/~akalia/erpc_doc) is available online.
+[Documentation](https://erpc.io/docs/index.html) is available online.
 
 Some highlights:
  * Multiple supported networks: Ethernet, InfiniBand, and RoCE
@@ -35,33 +35,27 @@ Some highlights:
 
 ## eRPC quickstart
  * Build and run the test suite:
-   `cmake . -DPERF=OFF -DTRANSPORT=infiniband; make -j; sudo ctest`.
+   `cmake . -DPERF=OFF -DTRANSPORT=dpdk; make -j; sudo ctest`.
    * `DPERF=OFF` enables debugging, which greatly reduces performance. Set
      `DPERF=ON` for performance measurements.
-   * Here, `infiniband` should be replaced with `raw` for Mellanox Ethernet
-     NICs, or `dpdk` for Intel Ethernet NICs.
+   * Here, `dpdk` should be replaced with `infiniband` for InfiniBand NICs.
    * A machine with two ports is needed to run the unit tests if DPDK is chosen.
      Run `scripts/run-tests-dpdk.sh` instead of `ctest`.
  * Run the `hello_world` application:
    * `cd hello_world`
    * Edit the server and client hostnames in `common.h` 
    * Based on the transport that eRPC was compiled for, compile `hello_world`
-     using `make infiniband`, `make raw`, or `make dpdk`.
+     using `make dpdk`, or `make infiniband`.
    * Run `./server` at the server, and `./client` at the client
  * Generate the documentation: `doxygen`
 
 ## Supported bare-metal NICs:
  * Ethernet/UDP mode:
-   * ConnectX-4 or newer Mellanox Ethernet NICs: Use `DTRANSPORT=raw`
-   * DPDK-enabled NICs that support flow-director: Use `DTRANSPORT=dpdk`
-     * Intel 82599 and Intel X710 NICs have been tested
-     * `raw` transport is faster for Mellanox NICs, which also support DPDK
+   * DPDK-enabled NICs: Use `DTRANSPORT=dpdk`
+     * We have primarily tested Mellanox CX3--CX5 NICs.
    * DPDK-enabled NICs on Microsoft Azure: Use `-DTRANSPORT=dpdk -DAZURE=on`
-   * ConnectX-3 Ethernet NICs are supported in eRPC's RoCE mode
  * RDMA (InfiniBand/RoCE) NICs: Use `DTRANSPORT=infiniband`. Add `DROCE=on`
    if using RoCE.
- * Mellanox drivers optimized specially for eRPC are available in the `drivers`
-   directory
 
 ## Running eRPC over DPDK on Microsoft Azure VMs
 
@@ -77,7 +71,7 @@ Some highlights:
       --resource-group <your resource group> --name <a name for the NIC>
       --vnet-name <name of the VMs' virtual network> --subnet default
       --accelerated-networking true --subscription <Azure subscription, if
-      any>`
+      any> --location <the VM's availability zone>`
     * Stop the VM launched earlier, and attach the NIC created in the previous
       step to the VM (i.e., in "Networking" -> "Attach network interface").
     * Re-start the VM. It should have a new interface called `eth1`, which eRPC
@@ -90,7 +84,7 @@ Some highlights:
        * `cmake .`
        * `sudo make install`
     * Install upstream pre-requisite libraries and modules:
-       * `sudo apt install make cmake g++ gcc libnuma-dev libibverbs-dev libgflags-dev numactl`
+       * `sudo apt install make cmake g++ gcc libnuma-dev libgflags-dev numactl`
        * `sudo modprobe ib_uverbs`
        * `sudo modprobe mlx4_ib`
     * Download the [DPDK 19.11.5 tarball](https://core.dpdk.org/download/) and
@@ -126,14 +120,14 @@ make latency
     * At VM #2: `./scripts/do.sh 1 0`
 
 
-## Configuring and running the provided applications
+## Configuring and running the provided benchmarks
  * The `apps` directory contains a suite of benchmarks and examples. The
    instructions below are for this suite of applications. eRPC can also be
    simply linked as a library instead (see `hello_world/` for an example).
  * To build an application, create `scripts/autorun_app_file` and change its
    contents to one of the available directory names in `apps/`. See
    `scripts/example_autorun_app_file` for an example. Then generate a
-   Makefile using `cmake . -DPERF=ON -DTRANSPORT=raw/infiniband/dpdk`. 
+   Makefile using `cmake . -DTRANSPORT=dpdk/infiniband`. 
  * Each application directory in `apps/` contains a config file
    that must specify all flags defined in `apps/apps_common.h`. For example,
    `num_processes` specifies the total number of eRPC processes in the cluster.
@@ -159,7 +153,7 @@ make latency
    * Operating system
 
 ## Contact
-Anuj Kalia (akalia@cs.cmu.edu)
+Anuj Kalia
 
 ## License
 		Copyright 2018, Carnegie Mellon University

@@ -47,13 +47,13 @@ bool change_leader_to_node(AppContext *c, int raft_node_id) {
 void client_cont(void *, void *);  // Forward declaration
 
 void send_req_one(AppContext *c) {
-  c->client.req_start_tsc = erpc::rdtsc();
+  c->client.chrono_timer.reset();
 
   // Format the client's PUT request. Key and value are identical.
-  auto *req = reinterpret_cast<client_req_t *>(c->client.req_msgbuf.buf);
+  auto *req = reinterpret_cast<client_req_t *>(c->client.req_msgbuf.buf_);
   size_t rand_key = c->fast_rand.next_u32() & (kAppNumKeys - 1);
-  req->key[0] = rand_key;
-  req->value[0] = rand_key;
+  req->key = rand_key;
+  req->value.v[0] = rand_key;
 
   if (kAppVerbose) {
     printf("smr: Client sending request %s to leader index %zu [%s].\n",
@@ -69,36 +69,38 @@ void send_req_one(AppContext *c) {
 
 void client_cont(void *_context, void *) {
   auto *c = static_cast<AppContext *>(_context);
-  double latency_us = erpc::to_usec(erpc::rdtsc() - c->client.req_start_tsc,
-                                    c->rpc->get_freq_ghz());
-  c->client.req_us_vec.push_back(latency_us);
-  c->client.num_resps++;
+  const double latency_us = c->client.chrono_timer.get_ns() / 1000.0;
+  c->client.lat_us_hdr_histogram.insert(latency_us);
+  c->client.num_resps_this_measurement++;
+  c->client.num_resps_total++;
 
-  if (c->client.num_resps == 100000) {
-    // At this point, there is no request outstanding, so long compute is OK
-    auto &lat_vec = c->client.req_us_vec;
-    std::sort(lat_vec.begin(), lat_vec.end());
-
-    double us_min = lat_vec.at(0);
-    double us_median = lat_vec.at(lat_vec.size() / 2);
-    double us_99 = lat_vec.at(lat_vec.size() * .99);
-    double us_999 = lat_vec.at(lat_vec.size() * .999);
-    double us_max = lat_vec.at(lat_vec.size() - 1);
+  if (c->client.num_resps_this_measurement == 100000) {
+    c->client.num_resps_this_measurement = 0;
+    c->client.num_console_prints++;
 
     printf(
         "smr: Latency us = "
-        "{%.2f min, %.2f 50, %.2f 99, %.2f 99.9, %.2f max}. "
-        "Request window = %zu (best 1). Inline size = %zu (best 120).\n",
-        us_min, us_median, us_99, us_999, us_max, erpc::kSessionReqWindow,
-        erpc::CTransport::kMaxInline);
-    c->client.num_resps = 0;
-    c->client.req_us_vec.clear();
+        "{%.2f 50, %.2f 99, %.2f 99.9, %.2f 99.99, %.2f 99.999, %.2f max}. "
+        "Cumulative num responses %zu, request window = %zu (best 1).\n",
+        c->client.lat_us_hdr_histogram.percentile(50.0),
+        c->client.lat_us_hdr_histogram.percentile(99),
+        c->client.lat_us_hdr_histogram.percentile(99.9),
+        c->client.lat_us_hdr_histogram.percentile(99.99),
+        c->client.lat_us_hdr_histogram.percentile(99.999),
+        c->client.lat_us_hdr_histogram.max(), c->client.num_resps_total,
+        erpc::kSessionReqWindow);
+
+    // Warmup for the first few epochs
+    if (c->client.num_console_prints <= 4) {
+      c->client.num_resps_total = 0;
+      c->client.lat_us_hdr_histogram.reset();
+    }
   }
 
   if (likely(c->client.resp_msgbuf.get_data_size() > 0)) {
     // The RPC was successful
     auto *client_resp =
-        reinterpret_cast<client_resp_t *>(c->client.resp_msgbuf.buf);
+        reinterpret_cast<client_resp_t *>(c->client.resp_msgbuf.buf_);
 
     if (kAppVerbose) {
       printf("smr: Client received resp %s [%s].\n",
@@ -127,7 +129,7 @@ void client_cont(void *_context, void *) {
               c->client.leader_idx);
         }
 
-        usleep(200000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         break;
       }
 
@@ -136,7 +138,7 @@ void client_cont(void *_context, void *) {
             "smr: Client request to server %zu failed with code = "
             "try again. Trying again after 200 ms.\n",
             c->client.leader_idx);
-        usleep(200000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         break;
       }
     }
@@ -155,7 +157,7 @@ void client_func(erpc::Nexus *nexus, AppContext *c) {
 
   c->rpc = new erpc::Rpc<erpc::CTransport>(
       nexus, static_cast<void *>(c), kAppClientRpcId, sm_handler, kAppPhyPort);
-  c->rpc->retry_connect_on_invalid_rpc_id = true;
+  c->rpc->retry_connect_on_invalid_rpc_id_ = true;
 
   // Pre-allocate MsgBuffers
   c->client.req_msgbuf = c->rpc->alloc_msg_buffer_or_die(sizeof(client_req_t));

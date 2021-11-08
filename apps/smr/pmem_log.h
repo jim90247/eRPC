@@ -8,10 +8,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
-extern "C" {
-#include <raft/raft.h>
-}
 #include "../apps_common.h"
+#include "common.h"
+
+#ifdef SMR_USE_PMEM
+#include <libpmem.h>
+#else
+// Dummy versions of libpmem functions, to avoid #ifdef SMR_USE_PMEM everywhere
+
+void *pmem_memcpy_persist(void *, const void *, size_t) {
+  erpc::rt_assert(false, "pmem not supported\n");
+  return nullptr;
+}
+
+void *pmem_memset_persist(void *, int, size_t) {
+  erpc::rt_assert(false, "pmem not supported\n");
+  return nullptr;
+}
+
+void *pmem_map_file(const char *, size_t, int, uint32_t, size_t *, int *) {
+  erpc::rt_assert(false, "pmem not supported\n");
+  return nullptr;
+}
+#endif
+
+extern "C" {
+#include <raft.h>
+}
 
 // A persistent memory log that stores objects of type T
 template <class T>
@@ -33,11 +56,8 @@ class PmemLog {
 
   // Persistent metadata records
   struct {
-    static_assert(sizeof(raft_node_id_t) == 4, "");
-    static_assert(sizeof(raft_term_t) == 8, "");
-
-    // This is a hack. In __raft_persist_term, we must atomically commit
-    // both the term and the vote. raft_term_t is eight bytes, so the
+    // This is a hack. In the persist_term callback, we must atomically commit
+    // both the term and the vote. raft_term_t can be eight bytes, so the
     // combined size (12 B) exceeds the atomic write length (8 B). This is
     // simplified by shrinking the term to 4 B, and atomically doing an
     // 8-byte write to both \p term and \p voted_for.
@@ -111,13 +131,13 @@ class PmemLog {
   }
 
   void persist_term(raft_term_t term, raft_node_id_t voted_for) {
-    erpc::rt_assert(term < UINT32_MAX, "Term too large");
+    erpc::rt_assert(term < INT32_MAX, "Term too large for atomic pmem append");
     erpc::rt_assert(reinterpret_cast<uint8_t *>(p.voted_for) ==
                     reinterpret_cast<uint8_t *>(p.term) + 4);
 
     // 8-byte atomic commit
     uint32_t to_persist[2];
-    to_persist[0] = term;
+    to_persist[0] = static_cast<uint32_t>(term);
     to_persist[1] = static_cast<uint32_t>(voted_for);
     pmem_memcpy_persist(p.term, &to_persist, sizeof(size_t));
   }

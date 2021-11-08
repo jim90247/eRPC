@@ -6,6 +6,24 @@ include(CMakeDependentOption)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# Parse the build type
+if(PERF)
+  message(STATUS "Compilation optimized for performance.")
+  message(STATUS "Debugging is disabled.")
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+  set(TESTING OFF)
+else(PERF)
+  message(STATUS "Compilation not optimized for performance.")
+  message(STATUS "Debugging is enabled. Perf will be low.")
+  set(CMAKE_BUILD_TYPE Debug)
+  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0")
+
+  # For now, disable unit tests on Windows
+  if (NOT WIN32)
+    set(TESTING ON)
+  endif()
+endif(PERF)
+
 # Common sub-projects: HdrHistogram
 set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "Minimize HDR histogram build")
 set(HDR_LOG_REQUIRED OFF CACHE BOOL "Disable HDR histogram's log to avoid zlib dependency")
@@ -23,28 +41,10 @@ add_subdirectory(third_party/gflags)
 # Common sub-projects: asio
 include_directories(SYSTEM third_party/asio/include)
 
-if(MSVC)
-  message("Using MSVC build")
-else()
-  message("Using non-MSVC build")
-  set(CMAKE_CXX_FLAGS "-std=c++11 -march=native -Wall -Wextra -Werror -pedantic")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-conversion -Wold-style-cast -Wno-unused-function")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nested-anon-types -Wno-keyword-macro -Wno-deprecated-declarations -Wno-address-of-packed-member")
-endif()
-
-# Parse the user-exposed options
-if(PERF)
-  message(STATUS "Compilation optimized for performance.")
-  message(STATUS "Debugging is disabled.")
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
-  set(TESTING OFF)
-else(PERF)
-  message(STATUS "Compilation not optimized for performance.")
-  message(STATUS "Debugging is enabled. Perf will be low.")
-  set(CMAKE_BUILD_TYPE Debug)
-  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0")
-  set(TESTING ON)
-endif(PERF)
+# Add additional compilation flags only after adding subprojects
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -march=native -Wall -Wextra -Werror -pedantic")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-conversion -Wold-style-cast -Wno-unused-function")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nested-anon-types -Wno-keyword-macro -Wno-deprecated-declarations -Wno-address-of-packed-member")
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/third_party)
@@ -145,6 +145,7 @@ set(SOURCES
   src/transport_impl/raw/raw_transport_datapath.cc
   src/transport_impl/fake/fake_transport.cc
   src/util/huge_alloc.cc
+  src/util/numautils.cc
   src/util/tls_registry.cc)
 
 # Transport-specific. Mellanox OFED drivers are the best choice for raw and
@@ -172,7 +173,6 @@ elseif(TRANSPORT STREQUAL "fake")
   set(CONFIG_TRANSPORT "FakeTransport")
   set(CONFIG_HEADROOM 40)
 else()
-  # Here, the transport is either InfiniBand or Mellanox Raw Ethernet
   set(CONFIG_IS_AZURE false)
   find_library(IBVERBS_LIB ibverbs)
   if(NOT IBVERBS_LIB)
@@ -183,6 +183,11 @@ else()
   if(TRANSPORT STREQUAL "raw")
     set(CONFIG_TRANSPORT "RawTransport")
     set(CONFIG_HEADROOM 40)
+    message(FATAL_ERROR
+      "eRPC no longer supports Raw transport, please use DTRANSPORT=dpdk instead. "
+      "If you wish to use the Raw transport, please use this version: "
+      "https://github.com/erpc-io/eRPC/releases/tag/v0.1. You'll need to "
+      "install an old version of Mellanox OFED (4.4 or older).")
   elseif(TRANSPORT STREQUAL "fake")
     set(CONFIG_TRANSPORT "FakeTransport")
     set(CONFIG_HEADROOM 40)
@@ -229,11 +234,16 @@ else()
 endif()
 
 if(APP STREQUAL "smr")
-  # Raft library from willemt/raft, installed at system-level
-  set(LIBRARIES ${LIBRARIES} raft ${PMEM})
-  # MICA
   include_directories(mica/src)
-  set(APP_ADDITIONAL_SOURCES ${MICA_SOURCES})
+  add_subdirectory(${CMAKE_SOURCE_DIR}/apps/smr/willemt_raft)
+  include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/apps/smr/willemt_raft/include)
+  if (WIN32)
+    link_directories(${CMAKE_SOURCE_DIR}/build)
+    set(LIBRARIES ${LIBRARIES} raft.lib)
+  else()
+    link_directories(${CMAKE_SOURCE_DIR}/apps/smr/willemt_raft)
+    set(LIBRARIES ${LIBRARIES} raft ${PMEM})
+  endif()
 elseif(APP STREQUAL "masstree_analytics")
   # CMake-based Masstree library from anujkaliaiitd/masstree-beta
   link_directories(${CMAKE_SOURCE_DIR}/third_party/masstree-beta)
@@ -261,13 +271,13 @@ endif()
 if(DPDK_NEEDED STREQUAL "true")
   message(STATUS "DPDK needed to build eRPC")
 
-  if (MSVC)
+  if (WIN32)
     message(STATUS "DPDK for Windows")
 
     # Set this to your DPDK directory
-    set(DPDK_WINDIR "C:\\Users\\ankalia\\Desktop\\dpdk-21.05")
-    if(NOT EXISTS "${DPDK_WINDIR}\\lib\\eal\\include\\rte_common.h")
-      message(FATAL_ERROR "rte_common.h not found")
+    set(DPDK_WINDIR "${CMAKE_CURRENT_SOURCE_DIR}/../dpdk")
+    if(NOT EXISTS "${DPDK_WINDIR}/lib/eal/include/rte_common.h")
+      message(FATAL_ERROR "rte_common.h not found. DPDK_WINDIR = ${DPDK_WINLIBS}")
       return()
     endif()
 
@@ -278,24 +288,48 @@ if(DPDK_NEEDED STREQUAL "true")
       meter metrics net node pci pdump pipeline port power rawdev rcu regexdev
       reorder rib ring sched security stack table telemetry timer vhost)
     foreach(lib_name IN LISTS DPDK_WINLIBS)
-      include_directories(SYSTEM "${DPDK_WINDIR}\\lib\\${lib_name}")
+      include_directories(SYSTEM "${DPDK_WINDIR}/lib/${lib_name}")
     endforeach()
 
-    include_directories(SYSTEM "${DPDK_WINDIR}\\lib\\eal\\include")
-    include_directories(SYSTEM "${DPDK_WINDIR}\\lib\\eal\\windows\\include")
-    include_directories(SYSTEM "${DPDK_WINDIR}\\lib\\eal\\x86\\include")
-    include_directories(SYSTEM "${DPDK_WINDIR}\\config")
-    include_directories(SYSTEM "${DPDK_WINDIR}\\build")
+    include_directories(SYSTEM "${DPDK_WINDIR}/lib/eal/include")
+    include_directories(SYSTEM "${DPDK_WINDIR}/lib/eal/windows/include")
+    include_directories(SYSTEM "${DPDK_WINDIR}/lib/eal/x86/include")
+    include_directories(SYSTEM "${DPDK_WINDIR}/config")
+    include_directories(SYSTEM "${DPDK_WINDIR}/build")
 
-    link_directories("${DPDK_WINDIR}\\build\\lib")
-    set(LIBRARIES ${LIBRARIES} -Wl,--whole-archive -librte_common_iavf.a
-      -librte_bus_pci.a -librte_bus_vdev.a -librte_mempool_ring.a
-      -librte_net_i40e.a -librte_net_ice.a -librte_net_vmxnet3.a
-      -librte_cfgfile.a -librte_hash.a -librte_cmdline.a -librte_pci.a
-      -librte_ethdev.a -librte_meter.a -librte_net.a -librte_mbuf.a
-      -librte_mempool.a -librte_rcu.a -librte_ring.a -librte_eal.a
-      -librte_telemetry.a -librte_kvargs.a -Wl,--no-whole-archive)
-  else(MSVC)
+    link_directories("${DPDK_WINDIR}/build/lib")
+    link_directories("${DPDK_WINDIR}/build/drivers")
+
+    set(LIBRARIES ${LIBRARIES}
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_cfgfile.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_hash.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_cmdline.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_pci.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_ethdev.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_meter.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_net.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_mbuf.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_mempool.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_rcu.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_ring.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_eal.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_telemetry.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/lib/librte_kvargs.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_common_iavf.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_bus_pci.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_bus_vdev.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_common_mlx5.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_mempool_ring.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_net_i40e.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_net_ice.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_net_mlx5.a"
+      "-Wl,/WHOLEARCHIVE:${DPDK_WINDIR}/build/drivers/librte_net_vmxnet3.a"
+      "-lws2_32" "-lmincore" "-ladvapi32" "-lsetupapi" "-ldbghelp"
+      "C:/Program Files/Mellanox/MLNX_WinOF2_DevX_SDK/lib/mlx5devx.lib"
+      "-Wl,/SUBSYSTEM:CONSOLE" "-lkernel32" "-luser32" "-lgdi32" "-lwinspool"
+      "-lshell32" "-lole32" "-loleaut32" "-luuid" "-lcomdlg32" "-liphlpapi")
+
+  else(WIN32)
     message(STATUS "DPDK for Linux")
     find_library(DPDK_LIB dpdk)
     if(NOT DPDK_LIB)
@@ -314,30 +348,35 @@ if(DPDK_NEEDED STREQUAL "true")
       message(FATAL_ERROR "DPDK include directory not found")
     endif()
     include_directories(SYSTEM ${DPDK_INCLUDE_DIR})
-
-    # Build the eRPC DPDK management daemon
-    add_executable(erpc_dpdk_daemon
-      src/transport_impl/dpdk/dpdk_daemon.cc
-      src/transport_impl/dpdk/dpdk_externs.cc
-      src/transport_impl/dpdk/dpdk_init.cc)
-    target_link_libraries(erpc_dpdk_daemon ${LIBRARIES})
-  endif(MSVC)
+  endif(WIN32)
 else()
   message(STATUS "DPDK not needed to build eRPC")
 endif()
 
 set(LIBRARIES ${LIBRARIES} gflags hdr_histogram_static)
-if(NOT MSVC)
+if(NOT WIN32)
   set(LIBRARIES ${LIBRARIES} rt numa pthread)
 endif()
 
 # Compile the library
 add_library(erpc ${SOURCES})
 
+if(DPDK_NEEDED STREQUAL "true")
+  if (NOT WIN32)
+    # Build the eRPC DPDK management daemon for Linux only
+    add_executable(erpc_dpdk_daemon
+      src/transport_impl/dpdk/dpdk_daemon.cc
+      src/transport_impl/dpdk/dpdk_externs.cc
+      src/transport_impl/dpdk/dpdk_init.cc)
+    target_link_libraries(erpc_dpdk_daemon ${LIBRARIES})
+  endif()
+endif()
+
 # Using link-time optimization sometimes requires building with sources instead
 # of liberpc. See the hello world example's Makefile for an example of
 # compiling with liberpc.
 add_executable(${APP} apps/${APP}/${APP}.cc ${APP_ADDITIONAL_SOURCES} ${SOURCES})
+
 if(PERF)
   target_compile_options(${APP} PRIVATE "-flto")
 endif()
@@ -413,14 +452,21 @@ if(TESTING)
 
   # Utils that don't depend on liberpc. These tests are not run using ctest.
   set(UTIL_TESTS_INDEP
-    hugepage_caching_virt2phy_test
     heartbeat_mgr_test
     rand_test
     misc_test
     fixed_vector_test
     timely_test
     numautil_test
-    hdr_histogram_test)
+    hdr_histogram_test
+    udp_client_test
+    udp_server_test)
+
+  # Non-Windows tests
+  if (NOT WIN32)
+    set(UTIL_TESTS_INDEP ${UTIL_TESTS_INDEP}
+      hugepage_caching_virt2phy_test)
+  endif()
 
   foreach(test_name IN LISTS UTIL_TESTS_INDEP)
     add_executable(${test_name} tests/util_tests/${test_name}.cc)

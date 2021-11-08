@@ -1,13 +1,10 @@
 #ifdef ERPC_DPDK
 
-#include <iomanip>
-#include <stdexcept>
-
-#include <rte_thash.h>
-#include <rte_version.h>
-#include <set>
-#include "dpdk_externs.h"
 #include "dpdk_transport.h"
+#include <iomanip>
+#include <set>
+#include <stdexcept>
+#include "dpdk_externs.h"
 #include "util/huge_alloc.h"
 #include "util/numautils.h"
 
@@ -100,7 +97,10 @@ DpdkTransport::DpdkTransport(uint16_t sm_udp_port, uint8_t rpc_id,
     if (qp_id_ != kInvalidQpId) {
       ERPC_INFO("DPDK transport for Rpc %u got QP %zu\n", rpc_id, qp_id_);
     } else {
-      ERPC_ERROR("DPDK transport for Rpc %u failed to get free QP\n", rpc_id);
+      ERPC_ERROR(
+          "DPDK transport for Rpc %u failed to get a free TX/RQ queue pair. "
+          "All %zu available queue pairs are in use by Rpc objects.\n",
+          rpc_id, kMaxQueuesPerPort);
       throw std::runtime_error("Failed to get DPDK QP");
     }
 
@@ -174,9 +174,11 @@ void DpdkTransport::resolve_phy_port() {
   struct rte_eth_dev_info dev_info;
   rte_eth_dev_info_get(phy_port_, &dev_info);
 
-  rt_assert(std::string(dev_info.driver_name) == "net_mlx4" or
-                std::string(dev_info.driver_name) == "net_mlx5",
+  const std::string drv_name = dev_info.driver_name;
+  rt_assert(drv_name == "net_mlx4" or drv_name == "net_mlx5" or
+                drv_name == "mlx5_pci",
             "eRPC supports only mlx4 or mlx5 devices with DPDK");
+
   if (std::string(dev_info.driver_name) == "net_mlx4") {
     // MLX4 NICs report a reta size of zero, but they use 128 internally
     rt_assert(dev_info.reta_size == 0,
@@ -218,6 +220,84 @@ void DpdkTransport::resolve_phy_port() {
       phy_port_, mac_to_string(resolve_.mac_addr_).c_str(),
       ipv4_to_string(htonl(resolve_.ipv4_addr_)).c_str(), resolve_.reta_size_,
       resolve_.bandwidth_ * 8.0 / (1000 * 1000 * 1000));
+}
+
+/// Tokenize the input string by the delimiter into a vector
+static std::vector<std::string> ipconfig_helper_split(std::string input,
+                                                      char delimiter) {
+  std::vector<std::string> ret;
+  std::stringstream ss(input);
+  std::string token;
+
+  while (getline(ss, token, delimiter)) ret.push_back(token);
+  return ret;
+}
+
+uint32_t DpdkTransport::get_port_ipv4_addr(size_t phy_port) {
+  _unused(phy_port);
+#ifdef _WIN32
+  // Hack for now: Get the IP address of the second NIC using ipconfig.exe
+  std::string ipconfig_out = "";
+  {
+    const std::string cmd = "ipconfig.exe | findstr.exe IPv4";
+    FILE *pipe = _popen(cmd.c_str(), "r");
+    rt_assert(pipe != nullptr, "Failed to open pipe to run ipconfig.exe");
+
+    // Read from the pipe in chunks
+    static constexpr size_t kChunkSize = 512;
+    while (!feof(pipe)) {
+      char buf[kChunkSize];
+      if (fgets(buf, kChunkSize, pipe) != nullptr) ipconfig_out += buf;
+    }
+    _pclose(pipe);
+  }
+
+  // Here, ipconfig_out is a string of the form:
+  // \"   IPv4 Address. . . . . . . . . . . : 10.0.0.8
+  //      IPv4 Address. . . . . . . . . . . : 10.0.0.9\"
+  rt_assert(ipconfig_out.length() > 0, "ipconfig.exe failed to report ifaces");
+
+  // Extract the second line
+  const std::vector<std::string> ip_lines =
+      ipconfig_helper_split(ipconfig_out, '\n');
+  rt_assert(ip_lines.size() == 2,
+            "Failed to split ipconfig.exe output into two lines");
+
+  // ip_lines[1] is the string (ex):
+  // \"   IPv4 Address. . . . . . . . . . . : 10.0.0.9\"
+
+  const std::vector<std::string> ip_addr_splits =
+      ipconfig_helper_split(ip_lines[1], ':');
+  rt_assert(ip_addr_splits.size() == 2,
+            "Failed to split IP address line into two with delimiter :");
+
+  // ip_addr_splits[1] is the string (ex):
+  // \" 10.0.0.9\"
+  rt_assert(ip_addr_splits[1].at(0) == ' ',
+            "Expected space at beginning of IP address not found");
+  return ipv4_from_str(ip_addr_splits[1].substr(1).c_str());
+#else
+  if (kIsAzure) {
+    // This routine gets the IPv4 address of the interface called eth1
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq ifr;
+    ifr.ifr_addr.sa_family = AF_INET;
+    strncpy(ifr.ifr_name, "eth1", IFNAMSIZ - 1);
+    int ret = ioctl(fd, SIOCGIFADDR, &ifr);
+    rt_assert(ret == 0, "DPDK: Failed to get IPv4 address of eth1");
+    close(fd);
+    return ntohl(
+        reinterpret_cast<sockaddr_in *>(&ifr.ifr_addr)->sin_addr.s_addr);
+  } else {
+    // As a hack, use the LSBs of the port's MAC address for IP address
+    struct rte_ether_addr mac;
+    rte_eth_macaddr_get(phy_port, &mac);
+
+    uint32_t ret;
+    memcpy(&ret, &mac.addr_bytes[2], sizeof(ret));
+    return ret;
+  }
+#endif
 }
 
 void DpdkTransport::fill_local_routing_info(

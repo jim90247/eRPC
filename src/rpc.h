@@ -7,6 +7,7 @@
 #include "msg_buffer.h"
 #include "nexus.h"
 #include "pkthdr.h"
+#include "req_handle.h"
 #include "rpc_types.h"
 #include "session.h"
 #include "transport.h"
@@ -41,7 +42,7 @@ namespace erpc {
  *      be invoked when requests are received from clients.
  *    - Create the response in the request handle supplied to the handler.
  *      Use Rpc::enqueue_response with either of the two response handle msgbufs
- *      to send the reply.
+ *      (pre_resp_msgbuf_ or dyn_resp_msgbuf_) to send the reply.
  * -# For an RPC client thread:
  *    - Create an Rpc endpoint using the Nexus
  *    - Connect to remote endpoints with Rpc::create_session, specifying the
@@ -100,10 +101,12 @@ class Rpc {
    * \param sm_handler The session management callback that is invoked when
    * sessions are successfully created or destroyed.
    *
-   * @param phy_port An Rpc object uses one physical port on the NIC. phy_port
-   * is the zero-based index of that port among active ports, as listed by
-   * `ibv_devinfo` for Raw, InfiniBand, and RoCE transports; or by
-   * `dpdk-devbind` for DPDK transport.
+   * @param phy_port An Rpc object uses one port on a "datapath" NIC, which
+   * refers to a NIC that supports DPDK or ibverbs. phy_port is the zero-based
+   * index of that port among active ports, same as the one passed to
+   * `rte_eth_dev_info_get` for the DPDK transport; or as listed by
+   * `ibv_devinfo` for Raw, InfiniBand, and RoCE transports. Multiple Rpc
+   * objects may use the same phy_port.
    *
    * @throw runtime_error if construction fails
    */
@@ -190,6 +193,9 @@ class Rpc {
    * kConnected or \p kConnectFailed will be invoked after session creation
    * completes or fails.
    *
+   * Session establisment in eRPC is not optimized, and should be avoided
+   * on the datapath.
+   *
    * @return The local session number (>= 0) of the session if the session
    * handshake is successfully initiated, negative errno otherwise.
    *
@@ -265,9 +271,10 @@ class Rpc {
    * @param req_handle The handle passed to the request handler by eRPC
    *
    * @param resp_msgbuf The message buffer containing the response. This must
-   * be either the request handle's preallocated response buffer or its
-   * dynamic response. The preallocated response buffer may be used for only
-   * responses that fit in one packet, in which case it is the better choice.
+   * be either the request handle's preallocated response msgbuf or the request
+   * handle's dynamic response msgbuf. The preallocated response msgbuf may be
+   * used for only responses that fit in one packet, in which case it is the
+   * better choice.
    *
    * @note The restriction on resp_msgbuf is inconvenient to the user because
    * they cannot provide an arbitrary application-owned buffer. Unfortunately,
@@ -277,12 +284,26 @@ class Rpc {
    */
   void enqueue_response(ReqHandle *req_handle, MsgBuffer *resp_msgbuf);
 
-  /// Run the event loop for some milliseconds
+  /// Run the event loop for some milliseconds. See Rpc::run_event_loop_once()
+  /// for more on eRPC's event loop.
   inline void run_event_loop(size_t timeout_ms) {
     run_event_loop_timeout_st(timeout_ms);
   }
 
-  /// Run the event loop once
+  /**
+   * @brief Run one iteration of eRPC's event loop. Users must call this
+   * periodically to make progress, since the event loop performs most of eRPC's
+   * work, including
+   *
+   * -# Checking for new session handshake requests and responses, and invoking
+   *  corresponding callbacks
+   * -# Checking for new datapath requests and responses, and invoking
+   *  corresponding callbacks
+   * -# Scheduling and transmitting datapath packets, and retransmitting lost
+   *  packets
+   *
+   * This call returns immediately when there is no work to be done.
+   */
   inline void run_event_loop_once() { run_event_loop_do_one_st(); }
 
   /// Identical to alloc_msg_buffer(), but throws an exception on failure
@@ -810,7 +831,8 @@ class Rpc {
   static inline void copy_data_to_msgbuf(MsgBuffer *msgbuf, size_t pkt_idx,
                                          const pkthdr_t *pkthdr) {
     size_t offset = pkt_idx * TTr::kMaxDataPerPkt;
-    size_t to_copy = std::min(TTr::kMaxDataPerPkt, pkthdr->msg_size_ - offset);
+    size_t to_copy =
+        (std::min)(TTr::kMaxDataPerPkt, pkthdr->msg_size_ - offset);
     memcpy(&msgbuf->buf_[offset], pkthdr + 1, to_copy);  // From end of pkthdr
   }
 

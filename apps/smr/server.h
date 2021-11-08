@@ -11,8 +11,8 @@
 #include "smr.h"
 
 // Raft callback for displaying debugging information
-void __raft_console_log(raft_server_t *, raft_node_t *, void *,
-                        const char *buf) {
+void smr_raft_console_log_cb(raft_server_t *, raft_node_t *, void *,
+                             const char *buf) {
   if (kAppVerbose) {
     printf("raft: %s [%s].\n", buf, erpc::get_formatted_time().c_str());
   }
@@ -20,21 +20,21 @@ void __raft_console_log(raft_server_t *, raft_node_t *, void *,
 
 void set_raft_callbacks(AppContext *c) {
   raft_cbs_t raft_funcs;
-  raft_funcs.send_requestvote = __raft_send_requestvote;
-  raft_funcs.send_appendentries = __raft_send_appendentries;
-  raft_funcs.send_snapshot = __raft_send_snapshot;
-  raft_funcs.applylog = __raft_applylog;
-  raft_funcs.persist_vote = __raft_persist_vote;
-  raft_funcs.persist_term = __raft_persist_term;
-  raft_funcs.log_offer = __raft_log_offer;
-  raft_funcs.log_poll = __raft_log_poll;
-  raft_funcs.log_pop = __raft_log_pop;
-  raft_funcs.log_get_node_id = __raft_log_get_node_id;
-  raft_funcs.node_has_sufficient_logs = __raft_node_has_sufficient_logs;
-  raft_funcs.notify_membership_event = __raft_notify_membership_event;
+  raft_funcs.send_requestvote = smr_raft_send_requestvote_cb;
+  raft_funcs.send_appendentries = smr_raft_send_appendentries_cb;
+  raft_funcs.send_snapshot = smr_raft_send_snapshot_cb;
+  raft_funcs.applylog = smr_raft_applylog_cb;
+  raft_funcs.persist_vote = smr_raft_persist_vote_cb;
+  raft_funcs.persist_term = smr_raft_persist_term_cb;
+  raft_funcs.log_offer = smr_raft_log_offer_cb;
+  raft_funcs.log_poll = smr_raft_log_poll_cb;
+  raft_funcs.log_pop = smr_raft_log_pop_cb;
+  raft_funcs.log_get_node_id = smr_raft_log_get_node_id_cb;
+  raft_funcs.node_has_sufficient_logs = smr_raft_node_has_sufficient_logs_cb;
+  raft_funcs.notify_membership_event = smr_raft_notify_membership_event_cb;
 
   // Any non-null console callback will require vsnprintf in willemt/raft
-  raft_funcs.log = kAppEnableRaftConsoleLog ? __raft_console_log : nullptr;
+  raft_funcs.log = kAppEnableRaftConsoleLog ? smr_raft_console_log_cb : nullptr;
   raft_set_callbacks(c->server.raft, &raft_funcs, static_cast<void *>(c));
 }
 
@@ -42,7 +42,7 @@ void init_raft(AppContext *c) {
   c->server.raft = raft_new();
   raft_set_election_timeout(c->server.raft, kAppRaftElectionTimeoutMsec);
 
-  erpc::rt_assert(c->server.raft != nullptr);
+  erpc::rt_assert(c->server.raft != nullptr, "Failed to init raft");
 
   c->server.node_id = get_raft_node_id_for_process(FLAGS_process_id);
   printf("smr: Created Raft node with ID = %d.\n", c->server.node_id);
@@ -79,11 +79,11 @@ void send_client_response(AppContext *c, erpc::ReqHandle *req_handle,
            client_resp.to_string().c_str(), erpc::get_formatted_time().c_str());
   }
 
-  erpc::MsgBuffer &resp_msgbuf = req_handle->pre_resp_msgbuf;
-  auto *_client_resp = reinterpret_cast<client_resp_t *>(resp_msgbuf.buf);
+  erpc::MsgBuffer &resp_msgbuf = req_handle->pre_resp_msgbuf_;
+  auto *_client_resp = reinterpret_cast<client_resp_t *>(resp_msgbuf.buf_);
   *_client_resp = client_resp;
 
-  c->rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf,
+  c->rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_,
                             sizeof(client_resp_t));
   c->rpc->enqueue_response(req_handle, &resp_msgbuf);
 }
@@ -100,7 +100,7 @@ void client_req_handler(erpc::ReqHandle *req_handle, void *_context) {
 
   const erpc::MsgBuffer *req_msgbuf = req_handle->get_req_msgbuf();
   assert(req_msgbuf->get_data_size() == sizeof(client_req_t));
-  const auto *client_req = reinterpret_cast<client_req_t *>(req_msgbuf->buf);
+  const auto *client_req = reinterpret_cast<client_req_t *>(req_msgbuf->buf_);
 
   // Check if it's OK to receive the client's request
   raft_node_t *leader = raft_get_current_leader_node(c->server.raft);
@@ -149,7 +149,7 @@ void client_req_handler(erpc::ReqHandle *req_handle, void *_context) {
   ent.data.len = sizeof(client_req_t);
 
   int e = raft_recv_entry(c->server.raft, &ent, &leader_sav.msg_entry_response);
-  erpc::rt_assert(e == 0);
+  erpc::rt_assert(e == 0, "client_req_handle: raft_recv_entry failed");
 }
 
 void init_erpc(AppContext *c, erpc::Nexus *nexus) {
@@ -165,7 +165,7 @@ void init_erpc(AppContext *c, erpc::Nexus *nexus) {
   c->rpc = new erpc::Rpc<erpc::CTransport>(
       nexus, static_cast<void *>(c), kAppServerRpcId, sm_handler, kAppPhyPort);
 
-  c->rpc->retry_connect_on_invalid_rpc_id = true;
+  c->rpc->retry_connect_on_invalid_rpc_id_ = true;
 
   // Create a session to each Raft server, excluding self
   for (size_t i = 0; i < FLAGS_num_raft_servers; i++) {
@@ -187,12 +187,6 @@ void init_erpc(AppContext *c, erpc::Nexus *nexus) {
   }
 
   printf("smr: All sessions connected\n");
-}
-
-void init_mica(AppContext *c) {
-  auto config = mica::util::Config::load_file("apps/smr/kv_store.json");
-  c->server.table = new FixedTable(config.get("table"), kAppValueSize,
-                                   c->rpc->get_huge_alloc());
 }
 
 inline void call_raft_periodic(AppContext *c) {
@@ -217,9 +211,8 @@ void server_func(erpc::Nexus *nexus, AppContext *c) {
   // The Raft server must be initialized before running the eRPC event loop,
   // including running it for eRPC session management.
   init_raft(c);
-
-  init_erpc(c, nexus);  // Initialize eRPC
-  init_mica(c);         // Initialize the key-value store
+  init_erpc(c, nexus);
+  c->server.table.reserve(kAppNumKeys * 2);  // Pre-allocate buckets with room
 
   // The main loop
   size_t loop_tsc = erpc::rdtsc();
@@ -229,7 +222,7 @@ void server_func(erpc::Nexus *nexus, AppContext *c) {
 
       printf(
           "smr: Leader commit latency (us) = "
-          "{%.2f median, %.2f 99%%}. Number of log entries = %zu.\n",
+          "{%.2f median, %.2f 99%%}. Number of log entries = %ld.\n",
           kAppMeasureCommitLatency ? commit_latency.perc(.50) / 10.0 : -1.0,
           kAppMeasureCommitLatency ? commit_latency.perc(.99) / 10.0 : -1.0,
           raft_get_log_count(c->server.raft));
@@ -279,7 +272,8 @@ void server_func(erpc::Nexus *nexus, AppContext *c) {
   // This is OK even when kAppTimeEnt = false
   printf("smr: Printing first 1000 of %zu time entries.\n",
          c->server.time_ents.size());
-  size_t num_print = std::min(c->server.time_ents.size(), 1000ul);
+  const size_t num_print =
+      std::min(c->server.time_ents.size(), static_cast<size_t>(1000));
 
   if (num_print > 0) {
     size_t base_tsc = c->server.time_ents[0].tsc;
@@ -290,7 +284,7 @@ void server_func(erpc::Nexus *nexus, AppContext *c) {
     }
   }
 
-  printf("smr: Final log size (including uncommitted entries) = %zu.\n",
+  printf("smr: Final log size (including uncommitted entries) = %ld\n",
          raft_get_log_count(c->server.raft));
   delete c->rpc;
 }

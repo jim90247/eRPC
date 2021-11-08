@@ -17,8 +17,8 @@ struct app_appendentries_t {
   // Serialize the ingredients of an app_appendentries_t into a network buffer
   static void serialize(erpc::MsgBuffer &req_msgbuf, int node_id,
                         msg_appendentries_t *msg_ae) {
-    uint8_t *buf = req_msgbuf.buf;
-    auto *srlz = reinterpret_cast<app_appendentries_t *>(req_msgbuf.buf);
+    uint8_t *buf = req_msgbuf.buf_;
+    auto *srlz = reinterpret_cast<app_appendentries_t *>(req_msgbuf.buf_);
 
     // Copy the whole-message header
     srlz->node_id = node_id;
@@ -39,7 +39,7 @@ struct app_appendentries_t {
       buf += sizeof(client_req_t);
     }
 
-    assert(buf == req_msgbuf.buf + req_msgbuf.get_data_size());
+    assert(buf == req_msgbuf.buf_ + req_msgbuf.get_data_size());
   }
 
   static constexpr size_t kStaticMsgEntryArrSize = 16;
@@ -51,7 +51,7 @@ struct app_appendentries_t {
   static void unpack(const erpc::MsgBuffer *req_msgbuf,
                      msg_entry_t *static_msg_entry_arr,
                      AppMemPool<client_req_t> &log_entry_appdata_pool) {
-    uint8_t *buf = req_msgbuf->buf;
+    uint8_t *buf = req_msgbuf->buf_;
     auto *ae_req = reinterpret_cast<app_appendentries_t *>(buf);
     msg_appendentries_t &msg_ae = ae_req->msg_ae;
     assert(msg_ae.entries == nullptr);
@@ -81,7 +81,7 @@ struct app_appendentries_t {
         buf += sizeof(client_req_t);
       }
 
-      assert(buf == req_msgbuf->buf + req_msgbuf->get_data_size());
+      assert(buf == req_msgbuf->buf_ + req_msgbuf->get_data_size());
     }
   }
 };
@@ -102,7 +102,7 @@ void appendentries_handler(erpc::ReqHandle *req_handle, void *_context) {
   app_appendentries_t::unpack(req_msgbuf, static_msg_entry_arr,
                               c->server.log_entry_appdata_pool);
 
-  auto *ae_req = reinterpret_cast<app_appendentries_t *>(req_msgbuf->buf);
+  auto *ae_req = reinterpret_cast<app_appendentries_t *>(req_msgbuf->buf_);
   msg_appendentries_t &msg_ae = ae_req->msg_ae;
 
   if (kAppVerbose) {
@@ -112,26 +112,27 @@ void appendentries_handler(erpc::ReqHandle *req_handle, void *_context) {
            erpc::get_formatted_time().c_str());
   }
 
-  erpc::MsgBuffer &resp_msgbuf = req_handle->pre_resp_msgbuf;
+  erpc::MsgBuffer &resp_msgbuf = req_handle->pre_resp_msgbuf_;
   c->rpc->resize_msg_buffer(&resp_msgbuf, sizeof(msg_appendentries_response_t));
 
   // Only the buffers for entries in the append
   int e = raft_recv_appendentries(
       c->server.raft, raft_get_node(c->server.raft, ae_req->node_id), &msg_ae,
-      reinterpret_cast<msg_appendentries_response_t *>(resp_msgbuf.buf));
-  erpc::rt_assert(e == 0);
+      reinterpret_cast<msg_appendentries_response_t *>(resp_msgbuf.buf_));
+  erpc::rt_assert(e == 0, "raft_recv_appendentries failed");
 
   if (msg_ae.entries != static_msg_entry_arr) delete[] msg_ae.entries;
 
   if (kAppTimeEnt) c->server.time_ents.emplace_back(TimeEntType::kSendAeResp);
-  c->rpc->enqueue_response(req_handle, &req_handle->pre_resp_msgbuf);
+  c->rpc->enqueue_response(req_handle, &req_handle->pre_resp_msgbuf_);
 }
 
 void appendentries_cont(void *, void *);  // Fwd decl
 
 // Raft callback for sending appendentries message
-static int __raft_send_appendentries(raft_server_t *, void *, raft_node_t *node,
-                                     msg_appendentries_t *msg_ae) {
+static int smr_raft_send_appendentries_cb(raft_server_t *, void *,
+                                          raft_node_t *node,
+                                          msg_appendentries_t *msg_ae) {
   auto *conn = static_cast<connection_t *>(raft_node_get_udata(node));
   AppContext *c = conn->c;
 
@@ -158,7 +159,8 @@ static int __raft_send_appendentries(raft_server_t *, void *, raft_node_t *node,
     req_size += sizeof(msg_entry_t) + sizeof(client_req_t);
   }
 
-  erpc::rt_assert(req_size <= c->rpc->get_max_msg_size());
+  erpc::rt_assert(req_size <= c->rpc->get_max_msg_size(),
+                  "send_appendentries_cb: Message size too large");
 
   raft_req_tag_t *rrt = c->server.raft_req_tag_pool.alloc();
   rrt->req_msgbuf = c->rpc->alloc_msg_buffer_or_die(req_size);
@@ -191,8 +193,10 @@ void appendentries_cont(void *_context, void *_tag) {
 
     int e = raft_recv_appendentries_response(
         c->server.raft, rrt->node,
-        reinterpret_cast<msg_appendentries_response_t *>(rrt->resp_msgbuf.buf));
-    erpc::rt_assert(e == 0);
+        reinterpret_cast<msg_appendentries_response_t *>(
+            rrt->resp_msgbuf.buf_));
+    erpc::rt_assert(e == 0 || e == RAFT_ERR_NOT_LEADER,
+                    "raft_recv_appendentries_response error");
   } else {
     // The RPC failed. Fall through and call raft_periodic() again.
     printf("smr: Appendentries RPC to node %s failed to complete [%s].\n",

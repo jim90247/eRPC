@@ -35,12 +35,13 @@ struct app_stats_t {
   double rtt_99_us;  // 99th percentile packet RTT
   double rpc_50_us;
   double rpc_99_us;
-  size_t pad[1];
+  double rpc_999_us;
 
   app_stats_t() { memset(this, 0, sizeof(app_stats_t)); }
 
   static std::string get_template_str() {
-    return "rx_gbps tx_gbps re_tx rtt_50_us rtt_99_us rpc_50_us rpc_99_us";
+    return "rx_gbps tx_gbps re_tx rtt_50_us rtt_99_us rpc_50_us rpc_99_us "
+           "rpc_999_us";
   }
 
   /// Return a space-separated string of all stats
@@ -48,7 +49,7 @@ struct app_stats_t {
     return std::to_string(rx_gbps) + " " + std::to_string(tx_gbps) + " " +
            std::to_string(re_tx) + " " + std::to_string(rtt_50_us) + " " +
            std::to_string(rtt_99_us) + " " + std::to_string(rpc_50_us) + " " +
-           std::to_string(rpc_99_us);
+           std::to_string(rpc_99_us) + " " + std::to_string(rpc_999_us);
   }
 
   /// Accumulate stats
@@ -60,6 +61,7 @@ struct app_stats_t {
     this->rtt_99_us += rhs.rtt_99_us;
     this->rpc_50_us += rhs.rpc_50_us;
     this->rpc_99_us += rhs.rpc_99_us;
+    this->rpc_999_us += rhs.rpc_999_us;
     return *this;
   }
 };
@@ -72,8 +74,8 @@ class AppContext : public BasicAppContext {
   // >10 ms for 8MB RPCs under congestion. So erpc::Latency doesn't work here.
   std::vector<double> lat_vec;
 
-  struct timespec tput_t0;  // Start time for throughput measurement
-  app_stats_t* app_stats;   // Common stats array for all threads
+  erpc::ChronoTimer tput_t0;  // Start time for throughput measurement
+  app_stats_t* app_stats;     // Common stats array for all threads
 
   size_t stat_rx_bytes_tot = 0;  // Total bytes received
   size_t stat_tx_bytes_tot = 0;  // Total bytes transmitted
@@ -86,11 +88,11 @@ class AppContext : public BasicAppContext {
 // Allocate request and response MsgBuffers
 void alloc_req_resp_msg_buffers(AppContext* c) {
   for (size_t i = 0; i < FLAGS_concurrency; i++) {
-    c->req_msgbuf[i] = c->rpc->alloc_msg_buffer_or_die(FLAGS_req_size);
-    c->resp_msgbuf[i] = c->rpc->alloc_msg_buffer_or_die(FLAGS_resp_size);
+    c->req_msgbuf[i] = c->rpc_->alloc_msg_buffer_or_die(FLAGS_req_size);
+    c->resp_msgbuf[i] = c->rpc_->alloc_msg_buffer_or_die(FLAGS_resp_size);
 
     // Fill the request regardless of kAppMemset. This is a one-time thing.
-    memset(c->req_msgbuf[i].buf, kAppDataByte, FLAGS_req_size);
+    memset(c->req_msgbuf[i].buf_, kAppDataByte, FLAGS_req_size);
   }
 }
 

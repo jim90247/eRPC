@@ -21,20 +21,21 @@
 #include <rte_ethdev.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
+#include <rte_thash.h>
 #include <signal.h>
 
 namespace erpc {
 
 class DpdkTransport : public Transport {
  public:
-  static constexpr size_t kMaxQueuesPerPort = 16;
+  static constexpr size_t kMaxQueuesPerPort = kIsWindows ? 1 : 16;
   static constexpr size_t kInvalidQpId = SIZE_MAX;
 
   /// Contents of the memzone created by the eRPC DPDK daemon process
   struct ownership_memzone_t {
    private:
-    pthread_mutex_t lock_;  /// Guard for reading/writing to the memzone
-    size_t epoch_;  /// Incremented after each QP ownership change attempt
+    std::mutex mutex_;  /// Guard for reading/writing to the memzone
+    size_t epoch_;      /// Incremented after each QP ownership change attempt
     size_t num_qps_available_;
 
     struct {
@@ -51,29 +52,24 @@ class DpdkTransport : public Transport {
     struct rte_eth_link link_[kMaxPhyPorts];  /// Resolved link status
 
     void init() {
-      pthread_mutex_init(&lock_, nullptr);
-      memset(this, 0, sizeof(ownership_memzone_t));
+      new (&mutex_) std::mutex();  // Fancy in-place construction
       num_qps_available_ = kMaxQueuesPerPort;
+      epoch_ = 0;
+      memset(owner_, 0, sizeof(owner_));
     }
 
     size_t get_epoch() {
-      size_t ret;
-      pthread_mutex_lock(&lock_);
-      ret = epoch_;
-      pthread_mutex_unlock(&lock_);
-      return ret;
+      const std::lock_guard<std::mutex> guard(mutex_);
+      return epoch_;
     }
 
     size_t get_num_qps_available() {
-      size_t ret;
-      pthread_mutex_lock(&lock_);
-      ret = num_qps_available_;
-      pthread_mutex_unlock(&lock_);
-      return ret;
+      const std::lock_guard<std::mutex> guard(mutex_);
+      return num_qps_available_;
     }
 
     std::string get_summary(size_t phy_port) {
-      pthread_mutex_lock(&lock_);
+      const std::lock_guard<std::mutex> guard(mutex_);
       std::ostringstream ret;
       ret << "[" << num_qps_available_ << " QPs of " << kMaxQueuesPerPort
           << " available] ";
@@ -89,7 +85,6 @@ class DpdkTransport : public Transport {
         }
         ret << "]";
       }
-      pthread_mutex_unlock(&lock_);
 
       return ret.str();
     }
@@ -104,7 +99,7 @@ class DpdkTransport : public Transport {
      * reserved on phy_port. Else return kInvalidQpId.
      */
     size_t get_qp(size_t phy_port, size_t proc_random_id) {
-      pthread_mutex_lock(&lock_);
+      const std::lock_guard<std::mutex> guard(mutex_);
       epoch_++;
       const int my_pid = getpid();
 
@@ -116,7 +111,6 @@ class DpdkTransport : public Transport {
               "eRPC DpdkTransport: Found another process with same PID (%d) as "
               "mine. Process random IDs: mine %zu, other: %zu\n",
               my_pid, proc_random_id, owner.proc_random_id_);
-          pthread_mutex_unlock(&lock_);
           return kInvalidQpId;
         }
       }
@@ -127,12 +121,10 @@ class DpdkTransport : public Transport {
           owner.pid_ = my_pid;
           owner.proc_random_id_ = proc_random_id;
           num_qps_available_--;
-          pthread_mutex_unlock(&lock_);
           return i;
         }
       }
 
-      pthread_mutex_unlock(&lock_);
       return kInvalidQpId;
     }
 
@@ -146,14 +138,13 @@ class DpdkTransport : public Transport {
      * @return 0 if success, else errno
      */
     int free_qp(size_t phy_port, size_t qp_id) {
+      const std::lock_guard<std::mutex> guard(mutex_);
       const int my_pid = getpid();
-      pthread_mutex_lock(&lock_);
       epoch_++;
       auto &owner = owner_[phy_port][qp_id];
       if (owner.pid_ == 0) {
         ERPC_ERROR("eRPC DpdkTransport: PID %d tried to already-free QP %zu.\n",
                    my_pid, qp_id);
-        pthread_mutex_unlock(&lock_);
         return EALREADY;
       }
 
@@ -162,20 +153,22 @@ class DpdkTransport : public Transport {
             "eRPC DpdkTransport: PID %d tried to free QP %zu owned by PID "
             "%d. Disallowed.\n",
             my_pid, qp_id, owner.pid_);
-        pthread_mutex_unlock(&lock_);
         return EPERM;
       }
 
       num_qps_available_++;
       owner_[phy_port][qp_id].pid_ = 0;
-      pthread_mutex_unlock(&lock_);
       return 0;
     }
 
     /// Free-up QPs reserved by processes that exited before freeing a QP.
     /// This is safe, but it can leak QPs because of PID reuse.
     void daemon_reclaim_qps_from_crashed(size_t phy_port) {
-      pthread_mutex_lock(&lock_);
+#ifdef _WIN32
+      _unused(phy_port);
+      rt_assert(false, "Not implemented yet");
+#else
+      const std::lock_guard<std::mutex> guard(mutex_);
 
       for (size_t i = 0; i < kMaxQueuesPerPort; i++) {
         auto &owner = owner_[phy_port][i];
@@ -187,7 +180,7 @@ class DpdkTransport : public Transport {
           owner_[phy_port][i].pid_ = 0;
         }
       }
-      pthread_mutex_unlock(&lock_);
+#endif
     }
   };
 
@@ -276,29 +269,7 @@ class DpdkTransport : public Transport {
 
   /// Get the IPv4 address for \p phy_port. The returned IPv4 address is assumed
   /// to be in host-byte order.
-  uint32_t get_port_ipv4_addr(size_t phy_port) {
-    _unused(phy_port);
-    if (kIsAzure) {
-      // This routine gets the IPv4 address of the interface called eth1
-      int fd = socket(AF_INET, SOCK_DGRAM, 0);
-      struct ifreq ifr;
-      ifr.ifr_addr.sa_family = AF_INET;
-      strncpy(ifr.ifr_name, "eth1", IFNAMSIZ - 1);
-      int ret = ioctl(fd, SIOCGIFADDR, &ifr);
-      rt_assert(ret == 0, "DPDK: Failed to get IPv4 address of eth1");
-      close(fd);
-      return ntohl(
-          reinterpret_cast<sockaddr_in *>(&ifr.ifr_addr)->sin_addr.s_addr);
-    } else {
-      // As a hack, use the LSBs of the port's MAC address for IP address
-      struct rte_ether_addr mac;
-      rte_eth_macaddr_get(phy_port, &mac);
-
-      uint32_t ret;
-      memcpy(&ret, &mac.addr_bytes[2], sizeof(ret));
-      return ret;
-    }
-  }
+  static uint32_t get_port_ipv4_addr(size_t phy_port);
 
   // dpdk_transport_datapath.cc
   void tx_burst(const tx_burst_item_t *tx_burst_arr, size_t num_pkts);
@@ -325,66 +296,7 @@ class DpdkTransport : public Transport {
   /// Install a flow rule for queue \p qp_id on port \p phy_port. The IPv4 and
   /// UDP address are in host-byte order.
   static void install_flow_rule(size_t phy_port, size_t qp_id,
-                                uint32_t ipv4_addr, uint16_t udp_port) {
-    bool installed = false;
-
-    const int ntuple_filter_supported =
-        rte_eth_dev_filter_supported(phy_port, RTE_ETH_FILTER_NTUPLE);
-
-    const int fdir_filter_supported =
-        rte_eth_dev_filter_supported(phy_port, RTE_ETH_FILTER_FDIR);
-
-    if (ntuple_filter_supported != 0 && fdir_filter_supported != 0) {
-      ERPC_WARN("No flow steering supported by NIC. Apps likely won't work.\n");
-      return;
-    }
-
-    // Try the simplest filter first. I couldn't get FILTER_FDIR to work with
-    // ixgbe, although it technically supports flow director.
-    if (ntuple_filter_supported == 0) {
-      struct rte_eth_ntuple_filter ntuple;
-      memset(&ntuple, 0, sizeof(ntuple));
-      ntuple.flags = RTE_5TUPLE_FLAGS;
-      ntuple.dst_port = rte_cpu_to_be_16(udp_port);
-      ntuple.dst_port_mask = UINT16_MAX;
-      ntuple.dst_ip = rte_cpu_to_be_32(ipv4_addr);
-      ntuple.dst_ip_mask = UINT32_MAX;
-      ntuple.proto = IPPROTO_UDP;
-      ntuple.proto_mask = UINT8_MAX;
-      ntuple.priority = 1;
-      ntuple.queue = qp_id;
-
-      int ret = rte_eth_dev_filter_ctrl(phy_port, RTE_ETH_FILTER_NTUPLE,
-                                        RTE_ETH_FILTER_ADD, &ntuple);
-      if (ret != 0) {
-        ERPC_WARN("Failed to add ntuple filter. This could be survivable.\n");
-      } else {
-        ERPC_WARN("Installed ntuple flow rule. Queue %zu, RX UDP port = %u.\n",
-                  qp_id, udp_port);
-      }
-      installed = (ret == 0);
-    }
-
-    if (!installed && fdir_filter_supported == 0) {
-      // Use fdir filter for i40e (5-tuple not supported)
-      rte_eth_fdir_filter filter;
-      memset(&filter, 0, sizeof(filter));
-      filter.soft_id = qp_id;
-      filter.input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV4_UDP;
-      filter.input.flow.udp4_flow.dst_port = rte_cpu_to_be_16(udp_port);
-      filter.input.flow.udp4_flow.ip.dst_ip = rte_cpu_to_be_32(ipv4_addr);
-      filter.action.rx_queue = qp_id;
-      filter.action.behavior = RTE_ETH_FDIR_ACCEPT;
-      filter.action.report_status = RTE_ETH_FDIR_NO_REPORT_STATUS;
-
-      int ret = rte_eth_dev_filter_ctrl(phy_port, RTE_ETH_FILTER_FDIR,
-                                        RTE_ETH_FILTER_ADD, &filter);
-      rt_assert(ret == 0, "Failed to add fdir flow rule: ", strerror(-1 * ret));
-
-      ERPC_WARN("Installed flow-director rule. Queue %zu, RX UDP port = %u.\n",
-                qp_id, udp_port);
-    }
-  }
+                                uint32_t ipv4_addr, uint16_t udp_port);
 
   /// Initialize the memory registration and deregistration functions
   void init_mem_reg_funcs();
